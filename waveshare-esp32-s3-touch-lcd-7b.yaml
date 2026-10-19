@@ -1,0 +1,248 @@
+# =====================================================================
+#  Waveshare ESP32-S3-Touch-LCD-7B (1024 x 600) - ESPHome + LVGL base config
+#
+#  A tested starting point: display, backlight (dimmable), GT911 touch and
+#  one LVGL test page. Build your own dashboard on top of this.
+#
+#  Tested with ESPHome 2026.9.1 (ESP-IDF).
+#
+#  Fixes included for two issues that make this board look "flaky":
+#   1. Backlight sometimes stays off/very dim after boot when the backlight
+#      enable pin (EXIO2) is driven through a `power_supply` linked to the
+#      PWM output. Here EXIO2 is a plain switch and the backlight is
+#      re-applied 1 s after boot.
+#   2. GT911 touch sometimes fails on a cold boot ("touchscreen is marked
+#      FAILED: Communication failed"). After a failed attempt ESPHome
+#      switches to the secondary address 0x14 and stays there; on this board
+#      the chip lives at 0x5D. An interval retries setup on 0x5D.
+# =====================================================================
+
+substitutions:
+  name: waveshare-7b
+  friendly_name: "Waveshare 7B"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.9.0
+  on_boot:
+    # GT911 needs a moment after its reset through the IO expander
+    - priority: -150
+      then:
+        - delay: 300ms
+    # re-apply the backlight after boot (see fix 1 above)
+    - priority: -200
+      then:
+        - delay: 1s
+        - switch.turn_on: backlight_enable
+        - light.turn_on:
+            id: backlight
+            brightness: 100%
+            transition_length: 0s
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # against image shift/flicker with a PSRAM framebuffer on RGB panels
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      # TLS buffers in PSRAM instead of internal RAM
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # the RGB panel and wifi power save don't mix well
+  power_save_mode: none
+  ap: {}
+
+captive_portal:
+
+# ---------------------------------------------------------------------
+#  Hardware
+# ---------------------------------------------------------------------
+i2c:
+  - id: bus_a
+    sda: GPIO8
+    scl: GPIO9
+    frequency: 400kHz
+
+# IO expander (CH32V003 @ 0x24). EXIO numbers on this board:
+#   EXIO1 touch reset, EXIO2 backlight enable, EXIO3 LCD reset,
+#   EXIO4 SD card CS, EXIO5 USB/CAN select, EXIO6 LCD VDD enable
+waveshare_io_ch32v003:
+  id: io_ex
+  address: 0x24
+  i2c_id: bus_a
+
+# backlight enable (EXIO2) as a plain switch, separate from the brightness
+switch:
+  - platform: gpio
+    id: backlight_enable
+    name: Backlight enable
+    pin:
+      waveshare_io_ch32v003: io_ex
+      number: 2
+      mode:
+        output: true
+    restore_mode: ALWAYS_ON
+
+# backlight brightness: PWM output of the IO expander
+output:
+  - platform: waveshare_io_ch32v003
+    id: backlight_out
+    waveshare_io_ch32v003_id: io_ex
+    inverted: true
+    zero_means_zero: true
+    safe_pwm_levels:
+      min_value: 1
+      max_value: 247
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Backlight
+    icon: "mdi:tablet-dashboard"
+    output: backlight_out
+    default_transition_length: 0.3s
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: rpi_dpi_rgb
+    id: lcd
+    color_order: RGB
+    dimensions:
+      width: 1024
+      height: 600
+    pclk_frequency: 30MHz
+    pclk_inverted: true
+    de_pin: 5
+    pclk_pin: 7
+    hsync_pin:
+      number: 46
+      ignore_strapping_warning: true
+    vsync_pin:
+      number: 3
+      ignore_strapping_warning: true
+    hsync_pulse_width: 30
+    hsync_back_porch: 145
+    hsync_front_porch: 170
+    vsync_pulse_width: 2
+    vsync_back_porch: 23
+    vsync_front_porch: 12
+    data_pins:
+      red: [1, 2, 42, 41, 40]
+      green: [39, 0, 45, 48, 47, 21]
+      blue: [14, 38, 18, 17, 10]
+    reset_pin:
+      waveshare_io_ch32v003: io_ex
+      number: 3
+    enable_pin:
+      waveshare_io_ch32v003: io_ex
+      number: 6
+    update_interval: never
+    auto_clear_enabled: false
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    display: lcd
+    i2c_id: bus_a
+    # after the IO expander, otherwise the reset pin is not available yet
+    setup_priority: -200
+    interrupt_pin: GPIO4
+    calibration:
+      x_min: 0
+      x_max: 1024
+      y_min: 0
+      y_max: 600
+    reset_pin:
+      waveshare_io_ch32v003: io_ex
+      number: 1
+
+interval:
+  # retry GT911 setup on address 0x5D if it failed on boot (see fix 2 above)
+  - interval: 3s
+    then:
+      - lambda: |-
+          static int attempts = 0;
+          static bool reported = false;
+          if (id(touch)->is_failed() && attempts < 20) {
+            attempts++;
+            ESP_LOGW("touch", "Restarting GT911 (attempt %d)", attempts);
+            id(touch)->set_i2c_address(0x5D);
+            id(touch)->reset_to_construction_state();
+            id(touch)->call();
+            id(touch)->call();
+            id(touch)->disable_loop();
+            id(touch)->enable_loop();
+          } else if (!id(touch)->is_failed() && attempts > 0 && !reported) {
+            ESP_LOGI("touch", "GT911 OK after %d attempt(s)", attempts);
+            reported = true;
+          }
+  # test page: uptime and free internal RAM
+  - interval: 1s
+    then:
+      - lvgl.label.update:
+          id: l_info
+          text: !lambda 'return to_string(millis() / 1000) + " s   free RAM: " + to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024) + " kB";'
+
+# ---------------------------------------------------------------------
+#  LVGL test page - replace with your own dashboard
+# ---------------------------------------------------------------------
+lvgl:
+  displays: [lcd]
+  touchscreens: [touch]
+  # draw buffer in PSRAM; a smaller buffer goes to internal RAM and leaves
+  # too little for wifi
+  buffer_size: "100%"
+  default_font: montserrat_28
+  pages:
+    - id: p_test
+      bg_color: 0x101317
+      widgets:
+        - label:
+            align: CENTER
+            y: -80
+            text: "Waveshare 7B"
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+        - label:
+            id: l_info
+            align: CENTER
+            text: "-"
+            text_color: 0x36D1DC
+        - button:
+            align: CENTER
+            y: 110
+            width: 300
+            height: 90
+            on_click:
+              - lvgl.label.update:
+                  id: l_tap
+                  text: "Touch works"
+            widgets:
+              - label:
+                  id: l_tap
+                  align: CENTER
+                  text: "Tap here"
