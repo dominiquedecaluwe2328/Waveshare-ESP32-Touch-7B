@@ -43,6 +43,22 @@ Fix: every 3 s, if touch has failed, an interval sets the address back to `0x5D`
 3. Flash the first time over USB. After that, updates go over wifi (OTA).
 4. If your flash partition is too small for OTA after flashing a different firmware, flash the factory image over USB once.
 
+## Battery
+
+- The board has a PH2.0 connector for a single 3.7 V Li-ion cell and a CS8501 charger. Charging needs no configuration.
+- **Check the polarity first.** Many PH2.0 batteries are wired the other way round. Compare red/black with the + and − on the board before you plug it in.
+- **The battery only charges when the board is powered through the UART USB-C port.** On the USB port the board runs fine, but the CHARGE LED stays off. LEDs: POWER, CHARGE (charging), DONE (full).
+- Battery voltage can be read through the ADC of the IO expander:
+
+```yaml
+sensor:
+  - platform: waveshare_io_ch32v003
+    waveshare_io_ch32v003_id: io_ex
+    name: Battery voltage
+    reference_voltage: 9.9   # 3.3 V x 3:1 divider; calibrate against a multimeter
+    update_interval: 30s
+```
+
 ## Tips for building a dashboard on this board
 
 - Keep `buffer_size: 100%` (in PSRAM). A smaller buffer goes to internal RAM and leaves too little for wifi.
